@@ -1,10 +1,15 @@
+import jsons
+import logging
 from django.db import models
+from django.utils.html import format_html
 from django.utils.safestring import mark_safe
 from accounts.models import Person, Manager
 from threads.models import Education_Thread
 
-from typing import Any
+from typing import Any, Optional
 from decimal import Decimal
+
+logger = logging.getLogger(__name__)
 
 
 class Contract(models.Model):
@@ -48,16 +53,34 @@ class Contract(models.Model):
     class Meta:
         verbose_name = "Контракт"
         verbose_name_plural = "Контракты"
-        ordering = ["contract_number"]
+        ordering = ["-contract_number"]
 
     def __str__(self) -> str:
-        return f"Контракт №{self.contract_number} {self.get_authors_info()} {self.get_presenters_info()}"
+        articuls = self.get_articul()
+        return f"Контракт №{self.contract_number} по артикулу: {articuls}"
 
-    def get_authors_info(self: Any) -> str:
-        return ", ".join([f"{author.author.username} ({author.reward_percent}%)" for author in self.authors.all()])
+    def get_articul(self) -> str:
+        """Получение актикулов из авторского/ведущего контактов"""
+        author_articuls = set()
+        for author in self.authors.prefetch_related('thead').all():
+            author_articuls.update(author.thead.values_list('articul', flat=True))
 
-    def get_presenters_info(self: Any) -> str:
-        return ", ".join([f"{presenter.presenter.username} ({presenter.hourly_rate}/час)" for presenter in self.presenters.all()])
+        presenter_articuls = set()
+        for presenter in self.presenters.prefetch_related('thead').all():
+            presenter_articuls.update(presenter.thead.values_list('articul', flat=True))
+
+        all_articuls = list(author_articuls | presenter_articuls)
+        return ', '.join(all_articuls)
+
+    def get_authors_info(self) -> str:
+        """Получение данные по авторскому контракту"""
+        authors = self.authors.prefetch_related('author').all()
+        return ", ".join(f"{author.author.username} ({author.reward_percent}%)" for author in authors)
+
+    def get_presenters_info(self) -> str:
+        """Получение данные по ведущему контракту"""
+        presenters = self.presenters.prefetch_related('presenter').all()
+        return ", ".join(f"{presenter.presenter.username} ({presenter.hourly_rate}/час)" for presenter in presenters)
 
 
 class Author(models.Model):
@@ -101,10 +124,13 @@ class Author(models.Model):
 
     class Meta:
         verbose_name = "Авторский"
-        verbose_name_plural = "_Авторские"
+        verbose_name_plural = "Авторские"
 
     def __str__(self) -> str:
-        return f"{self.author} Выручки:{self.revenue} {self.currency}-Процент:{self.reward_percent}%-Тип награды:{self.reward_type}"
+        articuls = ", ".join(self.thead.values_list('articul', flat=True))
+        if articuls:
+            return f"{self.author} (Артикул: {articuls})"
+        return f"{self.author}"
 
 
 class Presenter(models.Model):
@@ -139,9 +165,12 @@ class Presenter(models.Model):
 
     class Meta:
         verbose_name = "Ведущий"
-        verbose_name_plural = "_Ведущие"
+        verbose_name_plural = "Ведущие"
 
     def __str__(self) -> str:
+        articuls = ", ".join(self.thead.values_list('articul', flat=True))
+        if articuls:
+            return f"{self.presenter} (Артикул: {articuls})"
         return f"{self.presenter}"
 
 
@@ -183,6 +212,11 @@ class Accrual(models.Model):
         related_name="updated_accruals",
         verbose_name="Кто изменил начисление",
         blank=True
+    )
+    created_at = models.DateTimeField(
+        verbose_name="Дата создание",
+        auto_now_add=True,
+        null=True
     )
     comment_manager = models.TextField(
         verbose_name="Комментарий менеджера",
@@ -227,7 +261,7 @@ class Accrual(models.Model):
             return "Нет данных"
         formula = self.calculation_formula.get("formula", "")
         html_formula = formula.replace("\n", "<br>")
-        return mark_safe(html_formula)
+        return format_html("{}", mark_safe(html_formula))
 
     def save(self, *args, **kwargs) -> None:
         self.set_contract_type()
@@ -248,12 +282,12 @@ class Accrual(models.Model):
     def update_calculation_formula(self) -> None:
         """Сериализация данных и сохранение в calculation_formula"""
         raw_data = self.get_raw_data()
-        result = self.calc(raw_data)
+        result = self.calculation(raw_data)
 
         if raw_data and result is not None:
             self.calculation_formula = {
                 "formula": self.generate_formula_text(result, raw_data),
-                # "raw_data": jsons.dump(raw_data)
+                "raw_data": jsons.dump(raw_data)
             }
         else:
             self.calculation_formula = {"error": "Недостаточно данных для расчета"}
@@ -263,11 +297,11 @@ class Accrual(models.Model):
         raw_data = {}
         try:
             if self.contract_type == "author":
-                authors = self.contract.authors.all()
+                authors = self.contract.authors.select_related('author').all()
                 if authors.exists():
                     raw_data = {
                         "authors": [],
-                        "total_revenue": self.real_revenue if self.real_revenue else Decimal("0"),
+                        "total_revenue": self.real_revenue if self.real_revenue else "0",
                         "currency": authors[0].currency if authors else "rub"
                     }
                     for author in authors:
@@ -277,17 +311,17 @@ class Accrual(models.Model):
                         })
 
             elif self.contract_type == "presenter":
-                presenters = self.contract.presenters.all()
+                presenters = self.contract.presenters.select_related('presenter').all()
                 if presenters.exists():
                     raw_data = {
                         "presenters": [],
-                        "hours_worked": float(self.hours_worked) if self.hours_worked else None,
+                        "hours_worked": self.hours_worked if self.hours_worked else None,
                         "currency": presenters[0].currency
                     }
                     for presenter in presenters:
                         raw_data["presenters"].append({
                             "name": str(presenter.presenter),
-                            "hourly_rate": float(presenter.hourly_rate),
+                            "hourly_rate": presenter.hourly_rate,
                         })
             elif self.contract_type == "combined":
                 raw_data = {
@@ -299,23 +333,23 @@ class Accrual(models.Model):
                 if authors.exists():
                     raw_data["authors"] = [{
                         "name": str(author.author),
-                        "reward_percent": float(author.reward_percent),
+                        "reward_percent": author.reward_percent,
                     } for author in authors]
-                    raw_data["total_revenue"] = float(self.real_revenue) if self.real_revenue else 0.0
+                    raw_data["total_revenue"] = self.real_revenue if self.real_revenue else 0
 
                 presenters = self.contract.presenters.all()
                 if presenters.exists():
                     raw_data["presenters"] = [{
                         "name": str(presenter.presenter),
-                        "hourly_rate": float(presenter.hourly_rate),
+                        "hourly_rate": presenter.hourly_rate,
                     } for presenter in presenters]
-                    raw_data["hours_worked"] = float(self.hours_worked) if self.hours_worked else 0.0
+                    raw_data["hours_worked"] = self.hours_worked if self.hours_worked else 0
         except Exception as e:
-            print(f"Ошибка при получении данных: {e}")
+            logger.error(f"Ошибка при получении данных: {e}")
         return raw_data
 
-    def calc(self, raw_data: Any) -> Any | None:
-        """Вычисляет сумму начисления из авторского/ведущего контракта"""
+    def calculation(self, raw_data: Any) -> Optional[Decimal]:
+        """Вычисляет сумму начисления на основе данных по контрактам."""
         if not raw_data:
             return None
         total = Decimal(0)
@@ -334,7 +368,7 @@ class Accrual(models.Model):
 
             return total.quantize(Decimal('0.01'))
         except (KeyError, TypeError) as e:
-            print(f"Ошибка расчета: {e}")
+            logger.error(f"Ошибка расчета: {e}")
             return None
 
     def generate_formula_text(self, result: Decimal, raw_data: dict) -> str:
@@ -342,22 +376,22 @@ class Accrual(models.Model):
         formula_lines = []
 
         if "authors" in raw_data and raw_data.get("total_revenue", 0) > 0:
-            formula_lines.append("Авториский: ")
+            formula_lines.append("По авторскому: ")
             for author in raw_data["authors"]:
                 line = (
-                    f"{author['name']}: {author['reward_percent']}% * "
+                    f"\n- {author['name']}: {author['reward_percent']}% * "
                     f"{raw_data['total_revenue']} {raw_data['currency']} = "
-                    f"{(Decimal(author['reward_percent'])) * Decimal(raw_data['total_revenue']) / 100:.2f}"
+                    f"{(Decimal(author['reward_percent']) * Decimal(raw_data['total_revenue'])) / 100:.2f}"
                 )
                 formula_lines.append(line)
 
         if "presenters" in raw_data and raw_data.get("hours_worked", 0) > 0:
-            formula_lines.append("\nВедущий: ")
+            formula_lines.append("По ведущему: ") if not formula_lines else formula_lines.append("\nПо ведущему: ")
             for presenter in raw_data["presenters"]:
                 line = (
-                    f"{presenter['name']}: {raw_data['hours_worked']} ч. × "
+                    f"\n- {presenter['name']}: {raw_data['hours_worked']} ч. × "
                     f"{presenter['hourly_rate']} {raw_data['currency']}/ч. = "
-                    f"{(Decimal(raw_data['hours_worked'])) * Decimal(presenter['hourly_rate']):.2f}"
+                    f"{Decimal(raw_data['hours_worked']) * Decimal(presenter['hourly_rate']):.2f}"
                 )
                 formula_lines.append(line)
 

@@ -9,9 +9,9 @@ class ThreadAdmin(admin.ModelAdmin):
         "started_at", "ended_at",
     )
     readonly_fields = ("articul",)
-    search_fields = ["name", "type_course",]
+    search_fields = ["name", "type_course", "articul"]
 
     def is_active(self, obj):
         return obj.is_active
     is_active.boolean = True
-    is_active.short_description = "Статус"
+    is_active.short_description = "Статус потока"
